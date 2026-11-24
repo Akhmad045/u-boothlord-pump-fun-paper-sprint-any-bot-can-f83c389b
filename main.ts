@@ -1,13 +1,19 @@
-// Pump.fun paper sprint bot: catch a coin early while it is climbing, get out fast.
+// Pump.fun paper sprint bot: buy a coin only after it has already proved it
+// can run, then take a quick profit or cut a small loss and move on.
 //
-// Idea, in one sentence: buy a freshly listed coin once its price has already
-// risen a quarter above its listing price on real buying, then sell the whole
-// position at the first of a profit target, a stop loss, a trailing give-back,
-// or a short time limit, and never touch that coin again.
+// Idea, in one sentence: wait until a freshly listed coin has risen half
+// again above its listing price on real buying, buy a small slice, then sell
+// the whole position at the first of a modest profit target, a tight stop
+// loss, a trailing give-back, or a short time limit, and never touch that
+// coin again.
 //
-// Why this shape fits a six-hour window: most new coins either run up quickly
-// and then fade back toward their listing price or die outright, so holding
-// anything for long gives the gains back. Small buys, many coins, quick exits.
+// Why this shape fits a six-hour window: the dev data says most new coins
+// spike inside a single slot and then fade back toward their listing price,
+// and a bot only sees end-of-slot prices and fills two slots later, so
+// chasing the first spike means buying the top. Waiting for a 50% rise
+// filters out the one-slot wonders, and the exits are kept tight because
+// the same data says a coin that has not paid off within a few minutes
+// almost never does. Small buys, many coins, quick exits.
 //
 // All decisions come from the harness state and slot numbers only. No clock,
 // no randomness, no network, no environment reads, so two runs on the same
@@ -22,38 +28,38 @@ import type { Batch, BotState, OrderInput } from "./vendor/makefun-bot.ts";
 // --- tuning knobs (all in plain sight, change them and re-grade) ---
 
 // Enter when the price is at least this far above the listing price...
-const ENTER_GAIN_NUM = 5n;
-const ENTER_GAIN_DEN = 4n; // 1.25x
+const ENTER_GAIN_NUM = 3n;
+const ENTER_GAIN_DEN = 2n; // 1.5x
 // ...but not if it already ran this far; a coin that far up is usually done.
 const ENTER_MAX_GAIN_NUM = 2n;
 const ENTER_MAX_GAIN_DEN = 1n; // 2x
 // Need at least this many buys on the coin before trusting the move.
-const ENTER_MIN_BUYS = 4;
-// Only coins listed within this many slots (~10 minutes at ~2.5 slots/s).
-const ENTER_MAX_AGE_SLOTS = 1500;
+const ENTER_MIN_BUYS = 6;
+// Only coins listed within this many slots (~16 minutes at ~2.5 slots/s).
+const ENTER_MAX_AGE_SLOTS = 2400;
 // The coin must already hold at least this much real SOL, so the 1%-of-reserve
 // size cap still lets us buy a meaningful amount (the guardrail counts a
 // round trip only when the buy spent at least 0.01 SOL).
-const ENTER_MIN_REAL_SOL = 2_000_000_000n;
+const ENTER_MIN_REAL_SOL = 3_000_000_000n;
 // Aim to spend this much per buy; the reserve cap usually binds first.
 const BUY_TARGET_LAMPORTS = 250_000_000n;
 // Never send a buy smaller than this (fees would eat it and it would not
 // count toward the 20-coin round-trip bar anyway).
 const BUY_MIN_LAMPORTS = 12_000_000n;
-// Sell everything at +60% over the entry price.
-const TAKE_PROFIT_NUM = 8n;
-const TAKE_PROFIT_DEN = 5n; // 1.6x
-// Sell everything at -25% under the entry price.
-const STOP_LOSS_NUM = 3n;
-const STOP_LOSS_DEN = 4n; // 0.75x
-// Once the price has peaked at least +40% over entry, sell if it gives back
-// 15% from that peak.
-const TRAIL_PEAK_NUM = 7n;
-const TRAIL_PEAK_DEN = 5n; // 1.4x
-const TRAIL_KEEP_NUM = 17n;
-const TRAIL_KEEP_DEN = 20n; // 0.85x of peak
-// Sell whatever is left after this many slots (~8 minutes).
-const MAX_HOLD_SLOTS = 1200;
+// Sell everything at +25% over the entry price.
+const TAKE_PROFIT_NUM = 5n;
+const TAKE_PROFIT_DEN = 4n; // 1.25x
+// Sell everything at -8% under the entry price.
+const STOP_LOSS_NUM = 23n;
+const STOP_LOSS_DEN = 25n; // 0.92x
+// Once the price has peaked at least +20% over entry, sell if it gives back
+// 10% from that peak.
+const TRAIL_PEAK_NUM = 6n;
+const TRAIL_PEAK_DEN = 5n; // 1.2x
+const TRAIL_KEEP_NUM = 9n;
+const TRAIL_KEEP_DEN = 10n; // 0.9x of peak
+// Sell whatever is left after this many slots (~4 minutes).
+const MAX_HOLD_SLOTS = 600;
 // Reject a fill whose price is worse than the decision price by more than this.
 const SLIPPAGE_BPS = 500;
 
@@ -200,9 +206,17 @@ function onBatch(state: BotState, batch: Batch) {
   const orders: OrderInput[] = [];
 
   // Exits first: every held position is checked against its exit rules.
+  // A coin with a sell already in flight gets no second sell order: the
+  // first one fills or is rejected, and a duplicate would only be rejected
+  // for insufficient tokens.
+  const sellPending = new Set<string>();
+  for (const pending of state.pending.values()) {
+    if (pending.order.side === "sell") sellPending.add(pending.order.mint);
+  }
   for (const [mint, holding] of state.positions) {
     const coin = coins.get(mint);
     if (coin === undefined || !coin.entered) continue;
+    if (sellPending.has(mint)) continue;
     const peakedHigh = atLeast(
       coin.peakVq,
       coin.peakVt,
